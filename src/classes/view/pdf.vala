@@ -129,6 +129,11 @@ namespace pdfpc {
         public bool transitions_enabled = false;
 
         /**
+         * Render request for the currently displayed slide, if pending
+         */
+        protected Renderer.Request? pending_request = null;
+
+        /**
          * ID of timeout used to delay re-rendering on resize
          */
         protected uint resize_tid = 0;
@@ -160,10 +165,6 @@ namespace pdfpc {
             if (this.disabled) {
                 return GLib.Source.REMOVE;
             }
-
-            // The pointer is needed to keep track of the slide progress inside
-            // the pre-render loop
-            int* p_slide = null;
 
             var metadata = this.get_metadata();
 
@@ -199,40 +200,72 @@ namespace pdfpc {
             int width, height;
             this.get_pixel_dimensions(out width, out height);
 
-            GLib.Idle.add(() => {
-                if (p_slide == null) {
-                    p_slide = malloc(sizeof(int));
-                    *p_slide = first_page;
+            // Queue the slides for rendering in the background; the results
+            // are stored in the cache. These requests are not cancelled on
+            // slide changes, the next slides mostly remain relevant, and
+            // already cached ones are skipped.
+            for (int slide = first_page;
+                slide >= 0 && slide <= last_slide;
+                slide = metadata.nearest_nonhidden(slide + 1)) {
+                if (this.user_slides && !metadata.is_user_slide(slide)) {
+                    continue;
                 }
-
-                if (!this.user_slides || metadata.is_user_slide(*p_slide)) {
-                    // We do not care about the result, as the
-                    // rendering function stores the rendered
-                    // pixmap in the cache if it is enabled. This
-                    // is exactly what we want.
-                    try {
-                        this.renderer.render(*p_slide, this.notes_area, width, height,
-                            true);
-                    } catch(Renderer.RenderError e) {
-                        GLib.printerr("Could pre-render page '%i': %s\n",
-                            *p_slide, e.message);
-                    }
+                try {
+                    this.renderer.request(slide, this.notes_area,
+                        width, height, Renderer.Priority.LOW, null, null);
+                } catch(Renderer.RenderError e) {
+                    GLib.printerr("Could pre-render page '%i': %s\n",
+                        slide, e.message);
                 }
-
-                // Increment one slide for each call and stop the loop if we
-                // have reached the last slide
-                *p_slide = *p_slide + 1;
-                *p_slide = metadata.nearest_nonhidden(*p_slide);
-                if (*p_slide > last_slide) {
-                    free(p_slide);
-                    return GLib.Source.REMOVE;
-                } else {
-                    return GLib.Source.CONTINUE;
-                }
-            });
+            }
 
             // don't repeat...
             return GLib.Source.REMOVE;
+        }
+
+        /**
+         * Cancel the pending render request of the current slide
+         */
+        protected void cancel_request() {
+            if (this.pending_request != null) {
+                this.pending_request.cancel();
+                this.pending_request = null;
+            }
+        }
+
+        /**
+         * Get the current slide in the given size, either from the cache
+         * (on_ready is then called right away) or by requesting a render in
+         * the background (pending_request is set until on_ready is called).
+         */
+        protected void fetch_current_slide(int width, int height,
+            owned Renderer.RenderCallback on_ready) {
+            int slide_number = this.current_slide_number;
+
+            var cached = this.renderer.lookup(slide_number, this.notes_area,
+                width, height, this.zoom_area);
+            if (cached != null) {
+                on_ready(cached);
+                return;
+            }
+
+            try {
+                this.pending_request = this.renderer.request(slide_number,
+                    this.notes_area, width, height, Renderer.Priority.HIGH,
+                    this.zoom_area,
+                    (surface) => {
+                        this.pending_request = null;
+                        if (surface == null) {
+                            GLib.printerr("The pdf page %d could not be rendered\n",
+                                slide_number);
+                            return;
+                        }
+                        on_ready(surface);
+                    });
+            } catch (Renderer.RenderError e) {
+                GLib.printerr("The pdf page %d could not be rendered: %s\n",
+                    slide_number, e.message);
+            }
         }
 
         /**
@@ -369,86 +402,113 @@ namespace pdfpc {
                     this.transition_tid = 0;
                 }
 
+                this.cancel_request();
+
                 // Save the previous slide for transition
                 var previous_slide = this.current_slide;
 
-                try {
-                    if (this.current_slide_number < this.n_slides &&
-                        !this.disabled) {
-                        this.current_slide =
-                            this.renderer.render(this.current_slide_number,
-                                this.notes_area, width, height,
-                                false, false, this.zoom_area);
-
-                        if (Options.prerender_slides != 0) {
-                            // cancel any pending pre-rendering
-                            if (this.prerender_tid != 0) {
-                                GLib.Source.remove(this.prerender_tid);
-                            }
-
-                            // wait before starting pre-rendering
-                            this.prerender_tid =
-                                GLib.Timeout.add(1000*Options.prerender_delay,
-                                    this.prerender);
-                        }
-                    } else {
-                        this.current_slide =
-                            this.renderer.fade_to_black(width, height);
-                    }
-                } catch (Renderer.RenderError e) {
-                    GLib.printerr("The pdf page %d could not be rendered: %s\n",
-                        this.current_slide_number, e.message);
+                if (this.current_slide_number >= this.n_slides ||
+                    this.disabled) {
+                    this.show_slide(this.renderer.fade_to_black(width, height),
+                        previous_slide, trans_slide_number, trans_inverse,
+                        sequential_move);
                     return;
                 }
 
-                // The transition manager object
-                View.TransitionManager transman = null;
+                this.fetch_current_slide(width, height, (slide) => {
+                        this.show_slide(slide, previous_slide,
+                            trans_slide_number, trans_inverse,
+                            sequential_move);
+                    });
 
-                if (!this.disabled && this.transitions_enabled &&
-                    sequential_move && previous_slide != null) {
-                    transman = new View.TransitionManager(metadata,
-                        trans_slide_number, previous_slide, this.current_slide,
-                        trans_inverse);
-                }
-
-                if (transman == null || !transman.is_enabled) {
-                    // Just the new slide
-                    this.buffer = this.current_slide;
-
-                    // Queue the signal
-                    this.entering_slide_queued = true;
-
-                    // Update the widget
-                    this.queue_draw();
-                } else {
-                    this.buffer = new Cairo.ImageSurface(Cairo.Format.RGB24,
+                // While rendering, show a scaled version of the slide if we
+                // have one, unless a transition is going to be played from
+                // the previous slide
+                bool may_transition = this.transitions_enabled &&
+                    sequential_move && previous_slide != null;
+                if (this.pending_request != null && !may_transition &&
+                    this.zoom_area == null) {
+                    var standin = this.renderer.lookup_any_size(
+                        this.current_slide_number, this.notes_area,
                         width, height);
-                    Cairo.Context buffer_cr = new Cairo.Context(this.buffer);
-
-                    var delay = transman.frame_duration;
-                    this.transition_tid = Timeout.add(delay, () => {
-                            var inprogress = transman.advance();
-
-                            // Ensure no active clipping from the previous frame
-                            buffer_cr.reset_clip();
-                            transman.draw_frame(buffer_cr);
-
-                            if (!inprogress) {
-                                // Queue the signal _prior_ to the final draw()
-                                this.entering_slide_queued = true;
-                            }
-
-                            this.queue_draw();
-
-                            if (inprogress) {
-                                return true;
-                            } else {
-                                this.transition_tid = 0;
-                                // Stop the timer
-                                return false;
-                            }
-                        }, Priority.HIGH);
+                    if (standin != null) {
+                        this.buffer = standin;
+                        this.queue_draw();
+                    }
                 }
+
+                if (Options.prerender_slides != 0) {
+                    // cancel any pending pre-rendering
+                    if (this.prerender_tid != 0) {
+                        GLib.Source.remove(this.prerender_tid);
+                    }
+
+                    // wait before starting pre-rendering
+                    this.prerender_tid =
+                        GLib.Timeout.add(1000*Options.prerender_delay,
+                            this.prerender);
+                }
+            }
+        }
+
+        /**
+         * Show a rendered slide, playing the transition from the previous
+         * one if appropriate
+         */
+        protected void show_slide(Cairo.ImageSurface slide,
+            Cairo.ImageSurface? previous_slide, int trans_slide_number,
+            bool trans_inverse, bool sequential_move) {
+            this.current_slide = slide;
+
+            // The transition manager object
+            View.TransitionManager transman = null;
+
+            if (!this.disabled && this.transitions_enabled &&
+                sequential_move && previous_slide != null) {
+                transman = new View.TransitionManager(this.get_metadata(),
+                    trans_slide_number, previous_slide, this.current_slide,
+                    trans_inverse);
+            }
+
+            if (transman == null || !transman.is_enabled) {
+                // Just the new slide
+                this.buffer = this.current_slide;
+
+                // Queue the signal
+                this.entering_slide_queued = true;
+
+                // Update the widget
+                this.queue_draw();
+            } else {
+                int width = slide.get_width();
+                int height = slide.get_height();
+                this.buffer = new Cairo.ImageSurface(Cairo.Format.RGB24,
+                    width, height);
+                Cairo.Context buffer_cr = new Cairo.Context(this.buffer);
+
+                var delay = transman.frame_duration;
+                this.transition_tid = Timeout.add(delay, () => {
+                        var inprogress = transman.advance();
+
+                        // Ensure no active clipping from the previous frame
+                        buffer_cr.reset_clip();
+                        transman.draw_frame(buffer_cr);
+
+                        if (!inprogress) {
+                            // Queue the signal _prior_ to the final draw()
+                            this.entering_slide_queued = true;
+                        }
+
+                        this.queue_draw();
+
+                        if (inprogress) {
+                            return true;
+                        } else {
+                            this.transition_tid = 0;
+                            // Stop the timer
+                            return false;
+                        }
+                    }, Priority.HIGH);
             }
         }
 
@@ -456,6 +516,7 @@ namespace pdfpc {
          * Invalidate the current slide, forcing redrawing on update
          */
         public void invalidate() {
+            this.cancel_request();
             this.current_slide_number = -1;
             this.current_slide = null;
         }
@@ -484,26 +545,29 @@ namespace pdfpc {
                 return GLib.Source.REMOVE;
             }
 
+            // A render is on its way; draw() checks the size again once
+            // it has arrived
+            if (this.pending_request != null) {
+                return GLib.Source.REMOVE;
+            }
+
             // Invalidated; keep the old content until the next display()
             if (this.current_slide_number < 0) {
                 return GLib.Source.REMOVE;
             }
 
-            try {
-                if (this.current_slide_number < this.n_slides &&
-                    !this.disabled) {
-                    this.buffer =
-                        this.renderer.render(this.current_slide_number,
-                            this.notes_area, width, height,
-                            false, false, this.zoom_area);
-                } else {
-                    this.buffer = this.renderer.fade_to_black(width, height);
-                }
+            if (this.current_slide_number >= this.n_slides || this.disabled) {
+                this.buffer = this.renderer.fade_to_black(width, height);
                 this.current_slide = this.buffer;
-            } catch (Renderer.RenderError e) {
+                this.queue_draw();
                 return GLib.Source.REMOVE;
             }
-            this.queue_draw();
+
+            this.fetch_current_slide(width, height, (slide) => {
+                    this.buffer = slide;
+                    this.current_slide = slide;
+                    this.queue_draw();
+                });
 
             return GLib.Source.REMOVE;
         }
@@ -525,14 +589,16 @@ namespace pdfpc {
 
             cr.scale((1.0/this.gdk_scale), (1.0/this.gdk_scale));
 
-            // On resize, stretch the old buffer for now and re-render the
-            // slide only once the size has settled
+            // On resize (or while showing a stand-in), stretch the buffer
+            // for now and re-render the slide once the size has settled
             if (width  != this.buffer.get_width() ||
                 height != this.buffer.get_height()) {
                 // (Re)start the timeout only when the size changes, not on
                 // every redraw
-                if (this.resize_tid == 0 || width != this.resize_width ||
-                    height != this.resize_height) {
+                if (this.pending_request == null &&
+                    (this.resize_tid == 0 ||
+                     width != this.resize_width ||
+                     height != this.resize_height)) {
                     if (this.resize_tid != 0) {
                         GLib.Source.remove(this.resize_tid);
                     }
