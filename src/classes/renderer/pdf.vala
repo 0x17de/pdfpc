@@ -157,7 +157,7 @@ namespace pdfpc {
             if (zoom_area == null &&
                 (force_cache || rtime > Options.cache_min_rtime/1000.0)) {
                 // keep very "precious" slides permanently
-                if (rtime > Options.cache_max_rtime) {
+                if (rtime > Options.cache_max_rtime/1000.0) {
                     permanent_cache = true;
                 }
                 this.cache.store(props, surface, permanent_cache);

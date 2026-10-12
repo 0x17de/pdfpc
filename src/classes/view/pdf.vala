@@ -129,6 +129,22 @@ namespace pdfpc {
         public bool transitions_enabled = false;
 
         /**
+         * ID of timeout used to delay re-rendering on resize
+         */
+        protected uint resize_tid = 0;
+
+        /**
+         * The widget size the resize timeout has been set up for
+         */
+        protected int resize_width = 0;
+        protected int resize_height = 0;
+
+        /**
+         * Delay before re-rendering the slide after a resize [ms]
+         */
+        protected const uint RESIZE_DELAY = 150;
+
+        /**
          * Zoom area
          */
         protected PresentationController.ScaledRectangle? zoom_area = null;
@@ -455,6 +471,44 @@ namespace pdfpc {
         }
 
         /**
+         * Re-render the current slide matching the new widget size
+         */
+        protected bool rerender_on_resize() {
+            this.resize_tid = 0;
+
+            int width, height;
+            this.get_pixel_dimensions(out width, out height);
+            if (this.buffer == null || width <= 1 || height <= 1 ||
+                (width  == this.buffer.get_width() &&
+                 height == this.buffer.get_height())) {
+                return GLib.Source.REMOVE;
+            }
+
+            // Invalidated; keep the old content until the next display()
+            if (this.current_slide_number < 0) {
+                return GLib.Source.REMOVE;
+            }
+
+            try {
+                if (this.current_slide_number < this.n_slides &&
+                    !this.disabled) {
+                    this.buffer =
+                        this.renderer.render(this.current_slide_number,
+                            this.notes_area, width, height,
+                            false, false, this.zoom_area);
+                } else {
+                    this.buffer = this.renderer.fade_to_black(width, height);
+                }
+                this.current_slide = this.buffer;
+            } catch (Renderer.RenderError e) {
+                return GLib.Source.REMOVE;
+            }
+            this.queue_draw();
+
+            return GLib.Source.REMOVE;
+        }
+
+        /**
          * This method is called by Gdk every time the widget needs to be redrawn.
          *
          * The implementation does a simple blit from the internal pixmap to
@@ -468,20 +522,30 @@ namespace pdfpc {
 
             int width, height;
             this.get_pixel_dimensions(out width, out height);
-            // Re-render the slide on resize events
-            if (width  != this.buffer.get_width() ||
-                height != this.buffer.get_height()) {
-                try {
-                    this.buffer =
-                        this.renderer.render(this.current_slide_number,
-                            this.notes_area, width, height,
-                            false, false, this.zoom_area);
-                } catch (Renderer.RenderError e) {
-                    return true;
-                }
-            }
 
             cr.scale((1.0/this.gdk_scale), (1.0/this.gdk_scale));
+
+            // On resize, stretch the old buffer for now and re-render the
+            // slide only once the size has settled
+            if (width  != this.buffer.get_width() ||
+                height != this.buffer.get_height()) {
+                // (Re)start the timeout only when the size changes, not on
+                // every redraw
+                if (this.resize_tid == 0 || width != this.resize_width ||
+                    height != this.resize_height) {
+                    if (this.resize_tid != 0) {
+                        GLib.Source.remove(this.resize_tid);
+                    }
+                    this.resize_width = width;
+                    this.resize_height = height;
+                    this.resize_tid = GLib.Timeout.add(RESIZE_DELAY,
+                        this.rerender_on_resize);
+                }
+
+                cr.scale((double) width/this.buffer.get_width(),
+                    (double) height/this.buffer.get_height());
+            }
+
             cr.set_source_surface(this.buffer, 0, 0);
             cr.paint();
 
